@@ -1,0 +1,1045 @@
+﻿import React, { useState, useEffect } from "react";
+import { Tag, Progress, DatePicker as AntDatePicker, Button, Pagination } from "antd";
+import { 
+  CalendarOutlined, 
+  CheckCircleOutlined, 
+  StarOutlined,
+  UserOutlined,
+  ShoppingCartOutlined,
+  SearchOutlined,
+  ClockCircleOutlined,
+  DollarOutlined,
+  ReloadOutlined
+} from "@ant-design/icons";
+import dayjs from "dayjs";
+import { api } from "../config/api";
+import { getCache, setCache, invalidateCache } from "../utils/cache";
+
+
+
+function EmployeeTracker() {
+  const [currentTime, setCurrentTime] = useState(new Date());
+  const [searchTerm, setSearchTerm] = useState("");
+  const [selectedDate, setSelectedDate] = useState(dayjs().format("YYYY-MM-DD"));
+  const [datePickerOpen, setDatePickerOpen] = useState(false);
+  const [attendanceData, setAttendanceData] = useState([]);
+  const [staffSalesData, setStaffSalesData] = useState([]);
+  const [posCheckoutData, setPosCheckoutData] = useState([]);
+  const [posCheckoutPage, setPosCheckoutPage] = useState(1);
+  const [performanceData, setPerformanceData] = useState([]);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
+
+  // Update current time
+  useEffect(() => {
+    const updatePHTime = () => {
+      const now = new Date();
+      const utc = now.getTime() + now.getTimezoneOffset() * 60000;
+      const phTime = new Date(utc + 8 * 60 * 60 * 1000);
+      setCurrentTime(phTime);
+    };
+
+    updatePHTime();
+    const timer = setInterval(updatePHTime, 1000);
+    return () => clearInterval(timer);
+  }, []);
+
+  const toTitle = (value) => {
+    if (!value) return "";
+    return value.charAt(0).toUpperCase() + value.slice(1);
+  };
+
+  const safeName = (u) => `${u?.firstname || ""} ${u?.lastname || ""}`.trim() || u?.username || "Unknown";
+
+  const formatTime = (value) => {
+    if (!value) return "-";
+  
+    if (typeof value === "string" && /^\d{2}:\d{2}/.test(value)) {
+      const [hourRaw, minuteRaw] = value.split(":");
+      const hour24 = Number(hourRaw);
+      const minute = Number(minuteRaw);
+      if (Number.isFinite(hour24) && Number.isFinite(minute)) {
+        const hour12 = hour24 % 12 || 12;
+        const ampm = hour24 >= 12 ? "PM" : "AM";
+        return `${hour12}:${String(minute).padStart(2, "0")} ${ampm}`;
+      }
+    }
+  
+    const date = new Date(value);
+    if (!Number.isNaN(date.getTime())) {
+      return date.toLocaleTimeString("en-PH", {
+        hour: "numeric",
+        minute: "2-digit",
+        hour12: true,
+        timeZone: "Asia/Manila"  // Changed from "UTC" to "Asia/Manila"
+      });
+    }
+  
+    return value;
+  };
+
+  const calculateAttendanceRate = (record) => {
+    if (!record.hasTimeIn) return 0;
+
+    const lateMinutes = Number(record.lateMinutes || 0);
+    const completionBase = record.hasTimeOut ? 100 : 50;
+    const latePenalty = Math.min(lateMinutes, completionBase);
+
+    return Math.max(0, completionBase - latePenalty);
+  };
+
+  const loadEmployeeData = async (forceRefresh = false) => {
+    setLoading(true);
+    setError("");
+    console.log("[EmployeeTracker] Loading data...", { selectedDate, forceRefresh });
+    try {
+      // Use date-specific cache key
+      const cacheKey = `employee_tracker_${selectedDate}`;
+      
+      // Try to get data from cache first for instant rendering
+      const cachedData = forceRefresh ? null : getCache(cacheKey);
+      
+      // If data is cached and valid, render it instantly
+      if (cachedData) {
+        setAttendanceData(Array.isArray(cachedData.attendanceData) ? cachedData.attendanceData : []);
+        setStaffSalesData(Array.isArray(cachedData.staffSalesData) ? cachedData.staffSalesData : []);
+        setPerformanceData(Array.isArray(cachedData.performanceData) ? cachedData.performanceData : []);
+        setLoading(false);
+        
+        // Still fetch fresh data in background to update cache
+        fetchAndUpdateCache(cacheKey, { silent: true });
+        return;
+      }
+
+      // Otherwise, fetch from backend
+      await fetchAndUpdateCache(cacheKey, { silent: false });
+    } catch (e) {
+      console.error("[EmployeeTracker] Load failed:", e);
+      setError(e?.message || "Failed to load employee tracker data from backend.");
+      setAttendanceData([]);
+      setStaffSalesData([]);
+      setPosCheckoutData([]);
+      setPerformanceData([]);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const fetchAndUpdateCache = async (cacheKey, { silent = false } = {}) => {
+    try {
+      const results = await Promise.allSettled([
+        api.get("/staff"),
+        api.get("/attendance", { params: { date: selectedDate } }),
+        api.get("/sales/tracker", { params: { date: selectedDate } }),
+      ]);
+
+      const labels = ["GET /staff", "GET /attendance", "GET /sales/tracker"];
+      const rejectedIdx = results.findIndex((r) => r.status === "rejected");
+      if (rejectedIdx !== -1) {
+        const reason = results[rejectedIdx].reason;
+        const status = reason?.response?.status;
+        const backendMessage =
+          reason?.response?.data?.message ||
+          reason?.response?.data?.error ||
+          reason?.message;
+
+        const authHint =
+          status === 401 || status === 419
+            ? "Unauthorized. Please login again (token missing/expired)."
+            : "";
+
+        throw new Error(
+          `${labels[rejectedIdx]} failed` +
+            (status ? ` (HTTP ${status})` : "") +
+            (backendMessage ? `: ${backendMessage}` : "") +
+            (authHint ? `\n${authHint}` : "")
+        );
+      }
+
+      const staffRes = results[0].value;
+      const attendanceRes = results[1].value;
+      const salesRes = results[2].value;
+
+      const staff = Array.isArray(staffRes.data?.data) ? staffRes.data.data : (Array.isArray(staffRes.data) ? staffRes.data : []);
+      const staffById = new Map(staff.map((s) => [s.id, s]));
+
+      // Handle paginated attendance response
+      let attendanceResponseData = [];
+      if (attendanceRes.data && typeof attendanceRes.data === 'object') {
+        attendanceResponseData = Array.isArray(attendanceRes.data.data) ? attendanceRes.data.data : 
+                                   Array.isArray(attendanceRes.data) ? attendanceRes.data : [];
+      }
+      
+      const attendance = attendanceResponseData.map((a) => {
+        const staffUser = staffById.get(a.user_id) || a.user;
+        const name = safeName(staffUser);
+        const position = staffUser?.branchAssignments?.[0]?.position || "Staff";
+        const statusRaw = a.status || (a.is_late ? "late" : "present");
+        const status = statusRaw === "present" ? "Present" : statusRaw === "late" ? "Late" : toTitle(statusRaw);
+
+        const tardiness =
+          a.is_late && (a.late_minutes || a.lateMinutes)
+            ? `${a.late_minutes || a.lateMinutes} min`
+            : a.is_late
+              ? "Late"
+              : "0 min";
+
+        return {
+          id: a.id,
+          user_id: a.user_id,
+          name,
+          position,
+          status,
+          hasTimeIn: Boolean(a.time_in),
+          hasTimeOut: Boolean(a.time_out),
+          lateMinutes: Number(a.late_minutes || a.lateMinutes || 0),
+          checkIn: formatTime(a.time_in),
+          time_out: formatTime(a.time_out),
+          tardiness: a.time_in ? tardiness : "-",
+        };
+      });
+
+      // Sales aggregation per staff (POS checkout)
+      const salesTracker = salesRes.data?.data || salesRes.data || {};
+      const checkoutRowsRaw = Array.isArray(salesTracker.checkoutRows) ? salesTracker.checkoutRows : [];
+      const staffAggRaw = salesTracker.staffAgg || {};
+      const topProductsRaw = salesTracker.topProducts || {};
+      const byStaff = new Map();
+
+      // Flat list of each checkout (transaction-level) - already pre-aggregated by backend
+      const checkoutRows = checkoutRowsRaw.map((row, idx) => {
+        const userId = row.user_id;
+        const staffUser = staffById.get(userId);
+        const employee = safeName(staffUser);
+        const senior = Boolean(row.senior_discount);
+        const discountAmount = Number(row.discount_amount || 0);
+
+        return {
+          id: row.id || `sale-${idx}`,
+          invoice: row.invoice_number || `INV-${row.id || idx + 1}`,
+          employee,
+          customerName: row.customer_name || "-",
+          createdAt: row.created_at || row.sale_date || null,
+          itemsCount: Number(row.items_count || 0),
+          subtotal: Number(row.subtotal || 0),
+          discountAmount,
+          seniorDiscount: senior,
+          total: Number(row.total || 0),
+          cashCollected: Number(row.cash_collected || 0),
+          changeGiven: Number(row.change_given ?? 0),
+        };
+      });
+
+      // Staff aggregates from backend
+      Object.entries(staffAggRaw).forEach(([userIdStr, aggRow]) => {
+        const userId = Number(userIdStr);
+        const staffUser = staffById.get(userId);
+        const employee = safeName(staffUser);
+        const topCategory = topProductsRaw?.[userIdStr] || "N/A";
+
+        byStaff.set(employee, {
+          id: employee,
+          employee,
+          checkoutCount: Number(aggRow.checkout_count || 0),
+          totalItemsSold: Number(aggRow.total_items_sold || 0),
+          grossTotal: Number(aggRow.gross_total || 0),
+          cashCollected: Number(aggRow.cash_collected || 0),
+          changeGiven: Number(aggRow.change_given || 0),
+          seniorDiscountCount: Number(aggRow.senior_discount_count || 0),
+          seniorDiscountTotal: Number(aggRow.senior_discount_total || 0),
+          topCategory,
+        });
+      });
+
+      const salesRows = Array.from(byStaff.values()).map((row, idx) => ({
+        ...row,
+        id: idx + 1,
+        topCategory: row.topCategory || "N/A",
+      }));
+
+      // Basic performance metrics (computed from attendance + sales for the selected date)
+      const perfByName = new Map();
+      for (const a of attendance) {
+        perfByName.set(a.name, {
+          id: a.id,
+          employee: a.name,
+          attendanceRate: calculateAttendanceRate(a),
+          productivity: 0,
+          qualityScore: 100,
+        });
+      }
+      const maxCheckouts = Math.max(1, ...salesRows.map((s) => s.checkoutCount || 0));
+      for (const s of salesRows) {
+        const existing = perfByName.get(s.employee) || {
+          id: s.id,
+          employee: s.employee,
+          attendanceRate: 0,
+          productivity: 0,
+          qualityScore: 100,
+        };
+        existing.productivity = Math.round((Number(s.checkoutCount || 0) / maxCheckouts) * 100);
+        perfByName.set(s.employee, existing);
+      }
+
+      const finalAttendanceData = attendance;
+      const finalStaffSalesData = salesRows;
+      const finalPosCheckoutData = checkoutRows;
+      const finalPerformanceData = Array.from(perfByName.values());
+
+      // Update state and cache
+      setAttendanceData(finalAttendanceData);
+      setStaffSalesData(finalStaffSalesData);
+      setPosCheckoutData(finalPosCheckoutData);
+      setPerformanceData(finalPerformanceData);
+
+      console.log("[EmployeeTracker] Fetch success", {
+        selectedDate,
+        staffCount: Array.isArray(staff) ? staff.length : 0,
+        attendanceCount: Array.isArray(finalAttendanceData) ? finalAttendanceData.length : 0,
+        staffSalesCount: Array.isArray(finalStaffSalesData) ? finalStaffSalesData.length : 0,
+        posCheckoutCount: Array.isArray(finalPosCheckoutData) ? finalPosCheckoutData.length : 0,
+        performanceCount: Array.isArray(finalPerformanceData) ? finalPerformanceData.length : 0,
+        silent,
+      });
+      
+      // Cache the fetched data (30 seconds TTL)
+      setCache(cacheKey, { attendanceData: finalAttendanceData, staffSalesData: finalStaffSalesData, posCheckoutData: finalPosCheckoutData, performanceData: finalPerformanceData }, 30 * 1000);
+    } catch (e) {
+      console.error(silent ? "[EmployeeTracker] Background fetch failed:" : "[EmployeeTracker] Fetch failed:", e);
+      if (!silent) throw e;
+    }
+  };
+
+  useEffect(() => {
+    loadEmployeeData();
+    
+    // Periodic cache update every 30 seconds to keep data fresh
+    const interval = setInterval(() => {
+      const cacheKey = `employee_tracker_${selectedDate}`;
+      fetchAndUpdateCache(cacheKey, { silent: true });
+    }, 30 * 1000);
+    
+    return () => clearInterval(interval);
+  }, [selectedDate]);
+
+  // Filter data by search term
+  const attendanceArray = Array.isArray(attendanceData) ? attendanceData : [];
+  const filteredAttendance = attendanceArray.filter(item =>
+    item.name.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  const staffSalesArray = Array.isArray(staffSalesData) ? staffSalesData : [];
+  const filteredSales = staffSalesArray.filter(item =>
+    item.employee.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  const posCheckoutArray = Array.isArray(posCheckoutData) ? posCheckoutData : [];
+  const filteredPosCheckouts = posCheckoutArray.filter((row) => {
+    const q = searchTerm.toLowerCase();
+    if (!q) return true;
+    return (
+      row.employee.toLowerCase().includes(q) ||
+      String(row.invoice || "").toLowerCase().includes(q) ||
+      String(row.customerName || "").toLowerCase().includes(q)
+    );
+  });
+
+  const POS_PAGE_SIZE = 5;
+  const posCheckoutTotal = filteredPosCheckouts.length;
+  const posCheckoutStart = (posCheckoutPage - 1) * POS_PAGE_SIZE;
+  const pagedPosCheckouts = filteredPosCheckouts.slice(posCheckoutStart, posCheckoutStart + POS_PAGE_SIZE);
+
+  const performanceArray = Array.isArray(performanceData) ? performanceData : [];
+  const filteredPerformance = performanceArray.filter(item =>
+    item.employee.toLowerCase().includes(searchTerm.toLowerCase())
+  );
+
+  // Calculate statistics
+  const presentCount = attendanceArray.filter(item => item.status === "Present").length;
+  const lateCount = attendanceArray.filter(item => item.status === "Late").length;
+  const absentCount = attendanceArray.filter(item => item.status === "Absent").length;
+  const totalTransactions = staffSalesArray.reduce((sum, item) => sum + (item.checkoutCount || 0), 0);
+  const totalSales = staffSalesArray.reduce((sum, item) => sum + (item.grossTotal || 0), 0);
+  const avgPerformance = performanceArray.length
+    ? Math.round(performanceData.reduce((sum, item) => sum + (item.productivity || 0), 0) / performanceData.length)
+    : 0;
+
+  const formatCurrency = (amount) => {
+    return `Γé▒${amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}`;
+  };
+
+  const getStatusTag = (status) => {
+    switch(status) {
+      case "Present":
+        return <Tag color="success" icon={<CheckCircleOutlined />}>Present</Tag>;
+      case "Late":
+        return <Tag color="warning" icon={<ClockCircleOutlined />}>Late</Tag>;
+      case "Absent":
+        return <Tag color="error">Absent</Tag>;
+      default:
+        return <Tag>{status}</Tag>;
+    }
+  };
+
+  // Attendance Table Columns
+  const attendanceColumns = [
+    {
+      title: "NO.",
+      key: "no",
+      width: 60,
+      render: (_, __, index) => <span className="text-gray-500">{index + 1}</span>,
+    },
+    {
+      title: "EMPLOYEE",
+      dataIndex: "name",
+      key: "name",
+      render: (name) => (
+        <div className="flex items-center gap-2">
+          <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-sm">
+            {name.charAt(0)}
+          </div>
+          <span className="font-medium">{name}</span>
+        </div>
+      ),
+    },
+    {
+      title: "POSITION",
+      dataIndex: "position",
+      key: "position",
+    },
+    {
+      title: "TIME IN",
+      dataIndex: "checkIn",
+      key: "checkIn",
+      render: (time) => time || '-',
+    },
+    {
+      title: "TIME OUT",
+      dataIndex: "time_out",
+      key: "timeOut",
+      render: (time) => time || '-',
+    },
+    {
+      title: "TARDINESS",
+      dataIndex: "tardiness",
+      key: "tardiness",
+      render: (tardiness) => tardiness !== '-' ? <span className="text-orange-500">{tardiness}</span> : '-',
+    },
+    {
+      title: "STATUS",
+      dataIndex: "status",
+      key: "status",
+      render: (status) => getStatusTag(status),
+    },
+  ];
+
+  // Staff Sales Table Columns
+  const salesColumns = [
+    {
+      title: "NO.",
+      key: "no",
+      width: 60,
+      render: (_, __, index) => <span className="text-gray-500">{index + 1}</span>,
+    },
+    {
+      title: "EMPLOYEE",
+      dataIndex: "employee",
+      key: "employee",
+      render: (name) => (
+        <div className="flex items-center gap-2">
+          <UserOutlined className="text-blue-500" />
+          <span className="font-medium">{name}</span>
+        </div>
+      ),
+    },
+    {
+      title: "CHECKOUTS",
+      dataIndex: "checkoutCount",
+      key: "checkoutCount",
+      render: (count) => (
+        <div className="flex items-center gap-2">
+          <ShoppingCartOutlined className="text-gray-400" />
+          <span className="font-semibold">{count}</span>
+        </div>
+      ),
+    },
+    {
+      title: "ITEMS SOLD",
+      dataIndex: "totalItemsSold",
+      key: "totalItemsSold",
+    },
+    {
+      title: "GROSS TOTAL",
+      dataIndex: "grossTotal",
+      key: "grossTotal",
+      render: (value) => <span className="text-green-600 font-semibold">{formatCurrency(value)}</span>,
+    },
+    {
+      title: "NET SALES",
+      key: "netSales",
+      render: (_, record) => <span className="text-blue-600 font-semibold">{formatCurrency(record.cashCollected - record.changeGiven)}</span>,
+    },
+    {
+      title: "SR. DISCOUNT",
+      key: "seniorDiscount",
+      render: (_, record) => (
+        record.seniorDiscountCount > 0 ? (
+          <div className="flex flex-col">
+            <Tag color="green" className="w-fit">Yes ({record.seniorDiscountCount})</Tag>
+            <span className="text-xs text-gray-500">- {formatCurrency(record.seniorDiscountTotal)}</span>
+          </div>
+        ) : (
+          <Tag color="default">No</Tag>
+        )
+      ),
+    },
+    {
+      title: "TOP CATEGORY",
+      dataIndex: "topCategory",
+      key: "topCategory",
+      render: (category) => <Tag color="blue">{category}</Tag>,
+    },
+  ];
+
+  const formatDateTime = (value) => {
+    if (!value) return "-";
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return String(value);
+    return date.toLocaleString("en-PH", {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: true,
+    });
+  };
+
+  // Performance Table Columns
+  const performanceColumns = [
+    {
+      title: "NO.",
+      key: "no",
+      width: 60,
+      render: (_, __, index) => <span className="text-gray-500">{index + 1}</span>,
+    },
+    {
+      title: "EMPLOYEE",
+      dataIndex: "employee",
+      key: "employee",
+      render: (name) => (
+        <div className="flex items-center gap-2">
+          <UserOutlined className="text-blue-500" />
+          <span className="font-medium">{name}</span>
+        </div>
+      ),
+    },
+    {
+      title: "ATTENDANCE RATE",
+      dataIndex: "attendanceRate",
+      key: "attendanceRate",
+      render: (value) => (
+        <div className="flex items-center gap-2">
+          <Progress percent={value} size="small" className="w-32" />
+          <span className="text-sm font-medium">{value}%</span>
+        </div>
+      ),
+    },
+    {
+      title: "PRODUCTIVITY",
+      dataIndex: "productivity",
+      key: "productivity",
+      render: (value) => (
+        <div className="flex items-center gap-2">
+          <Progress percent={value} size="small" strokeColor="#1677ff" className="w-32" />
+          <span className="text-sm font-medium">{value}%</span>
+        </div>
+      ),
+    },
+    {
+      title: "QUALITY SCORE",
+      dataIndex: "qualityScore",
+      key: "qualityScore",
+      render: (value) => (
+        <div className="flex items-center gap-2">
+          <Progress percent={value} size="small" strokeColor="#52c41a" className="w-32" />
+          <span className="text-sm font-medium">{value}%</span>
+        </div>
+      ),
+    },
+  ];
+
+  return (
+    <div className="h-screen flex flex-col bg-gray-50 overflow-hidden">
+      {/* Header - Sticky at top */}
+      <div className="bg-white border-b border-gray-200 px-6 py-4 shadow-sm flex-shrink-0">
+        <div className="max-w-7xl mx-auto">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-2xl font-bold text-gray-800">Employee Logs</h1>
+              <p className="text-gray-500 mt-1">Track employee attendance, sales, and performance in one view</p>
+            </div>
+            <div className="text-right">
+              <p className="text-sm text-gray-500">Current Philippines Time</p>
+              <p className="text-lg font-semibold">
+                {currentTime.toLocaleTimeString('en-PH', { hour12: true, hour: '2-digit', minute: '2-digit', second: '2-digit' })}
+              </p>
+              <p className="text-xs text-gray-400">
+                {currentTime.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' })}
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Scrollable Content Area */}
+      <div className="flex-1 overflow-y-auto">
+        <div className="max-w-7xl mx-auto px-6 py-6">
+          {loading && (
+            <div className="bg-blue-50 border border-blue-200 text-blue-800 rounded-lg px-4 py-3 mb-6 flex items-center justify-between gap-4">
+              <div className="flex items-center gap-3">
+                <ReloadOutlined className="animate-spin" />
+                <div className="text-sm">
+                  <div className="font-semibold">Fetching latest data from backendΓÇª</div>
+                  <div className="text-blue-700/80">Date: {selectedDate}</div>
+                </div>
+              </div>
+              <Button size="small" onClick={() => loadEmployeeData(true)}>
+                Retry now
+              </Button>
+            </div>
+          )}
+          {error && (
+            <div className="bg-red-50 border border-red-200 text-red-700 rounded-lg px-4 py-3 mb-6 flex items-start justify-between gap-4">
+              <div className="whitespace-pre-line text-sm">
+                <div className="font-semibold mb-1">Failed to load data</div>
+                <div>{error}</div>
+              </div>
+              <Button icon={<ReloadOutlined />} onClick={() => loadEmployeeData(true)}>
+                Retry
+              </Button>
+            </div>
+          )}
+          {/* Summary Cards */}
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wide">Attendance Today</p>
+                  <p className="text-2xl font-bold text-gray-800">{presentCount} / {attendanceArray.length} Present</p>
+                  <div className="flex gap-2 mt-1">
+                    <span className="text-xs text-orange-500">Late: {lateCount}</span>
+                    <span className="text-xs text-red-500">Absent: {absentCount}</span>
+                  </div>
+                </div>
+                <div className="bg-blue-100 rounded-full p-3">
+                  <CalendarOutlined className="text-xl text-blue-600" />
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wide">Total Transactions</p>
+                  <p className="text-2xl font-bold text-green-600">{totalTransactions}</p>
+                </div>
+                <div className="bg-green-100 rounded-full p-3">
+                  <ShoppingCartOutlined className="text-xl text-green-600" />
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wide">Total Sales</p>
+                  <p className="text-2xl font-bold text-purple-600">{formatCurrency(totalSales)}</p>
+                </div>
+                <div className="bg-purple-100 rounded-full p-3">
+                  <DollarOutlined className="text-xl text-purple-600" />
+                </div>
+              </div>
+            </div>
+            <div className="bg-white rounded-lg border border-gray-200 p-4">
+              <div className="flex items-center justify-between">
+                <div>
+                  <p className="text-xs text-gray-500 uppercase tracking-wide">Avg. Performance</p>
+                  <p className="text-2xl font-bold text-orange-600">{avgPerformance}%</p>
+                </div>
+                <div className="bg-orange-100 rounded-full p-3">
+                  <StarOutlined className="text-xl text-orange-600" />
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Filters */}
+          <div className="bg-white rounded-lg border border-gray-200 p-4 mb-6">
+            <div className="flex flex-wrap gap-4 items-center justify-between">
+              <div className="flex flex-col sm:flex-row gap-4 items-start sm:items-center w-full sm:w-auto">
+                <div className="w-full sm:w-auto">
+                  <label className="text-xs text-gray-500 block mb-1">Select Date</label>
+                  <div className="relative">
+                    <button
+                      type="button"
+                      onClick={() => setDatePickerOpen(true)}
+                      className="w-full sm:w-auto inline-flex items-center justify-between gap-3 px-3 py-2 rounded-md border border-gray-300 bg-white text-sm text-gray-800 hover:bg-gray-50 active:bg-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      aria-label="Select date"
+                    >
+                      <span className="inline-flex items-center gap-2">
+                        <CalendarOutlined className="text-gray-500" />
+                        <span className="font-medium">{selectedDate}</span>
+                      </span>
+                      <span className="text-xs text-gray-400">Tap to change</span>
+                    </button>
+
+                    {/* Hidden DatePicker used only for the calendar popup */}
+                    <AntDatePicker
+                      value={dayjs(selectedDate)}
+                      open={datePickerOpen}
+                      onOpenChange={(open) => setDatePickerOpen(open)}
+                      onChange={(date) => {
+                        if (date) {
+                          setSelectedDate(date.format("YYYY-MM-DD"));
+                        }
+                        setDatePickerOpen(false);
+                      }}
+                      format="YYYY-MM-DD"
+                      inputReadOnly
+                      size="middle"
+                      style={{
+                        position: "absolute",
+                        inset: 0,
+                        opacity: 0,
+                        pointerEvents: "none",
+                      }}
+                    />
+                  </div>
+                </div>
+                <div className="w-full sm:w-auto">
+                  <label className="text-xs text-gray-500 block mb-1">Search Employee</label>
+                  <div className="flex items-center border border-gray-300 rounded-md px-3 py-1.5">
+                    <SearchOutlined className="text-gray-400 text-sm mr-2" />
+                    <input
+                      type="text"
+                      placeholder="Enter name..."
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      className="text-sm outline-none w-full sm:w-48"
+                    />
+                  </div>
+                </div>
+              </div>
+              <Button 
+                icon={<ReloadOutlined />}
+                onClick={() => loadEmployeeData(true)}
+              >
+                Refresh
+              </Button>
+            </div>
+          </div>
+
+          {/* Attendance Overview Table */}
+          <div className="bg-white rounded-lg border border-gray-200 mb-6 overflow-hidden">
+            <div className="bg-gray-50 border-b border-gray-200 px-6 py-3">
+              <div className="flex items-center gap-2">
+                <CalendarOutlined className="text-blue-600" />
+                <span className="font-semibold text-gray-700">Attendance Overview</span>
+                <Tag color="blue" className="ml-2">
+                  {filteredAttendance.length} Records
+                </Tag>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    {attendanceColumns.map((col, idx) => (
+                      <th key={idx} className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                        {col.title}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {filteredAttendance.length === 0 ? (
+                    <tr>
+                      <td colSpan={attendanceColumns.length} className="text-center py-12 text-gray-500">
+                        No attendance records found for <span className="font-semibold">{selectedDate}</span>.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredAttendance.map((record, idx) => (
+                      <tr key={record.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 text-gray-500">{idx + 1}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <div className="w-8 h-8 bg-gradient-to-r from-blue-500 to-blue-600 rounded-full flex items-center justify-center text-white font-bold text-sm">
+                              {record.name.charAt(0)}
+                            </div>
+                            <span className="font-medium">{record.name}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-gray-600">{record.position}</td>
+                        <td className="px-4 py-3 font-mono text-sm">{record.checkIn}</td>
+                        <td className="px-4 py-3 font-mono text-sm">{record.time_out}</td>
+                        <td className="px-4 py-3">
+                          {record.tardiness !== '-' ? (
+                            <span className="text-orange-500">{record.tardiness}</span>
+                          ) : '-'}
+                        </td>
+                        <td className="px-4 py-3">{getStatusTag(record.status)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Staff Sales Table */}
+          <div className="bg-white rounded-lg border border-gray-200 mb-6 overflow-hidden">
+            <div className="bg-gray-50 border-b border-gray-200 px-6 py-3">
+              <div className="flex items-center gap-2">
+                <ShoppingCartOutlined className="text-green-600" />
+                <span className="font-semibold text-gray-700">Staff Sales (Based on POS Checkout)</span>
+                <Tag color="green" className="ml-2">
+                  {filteredSales.length} Staff
+                </Tag>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    {salesColumns.map((col, idx) => (
+                      <th key={idx} className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                        {col.title}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {filteredSales.length === 0 ? (
+                    <tr>
+                      <td colSpan={salesColumns.length} className="text-center py-12 text-gray-500">
+                        No sales records found for <span className="font-semibold">{selectedDate}</span>.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredSales.map((record, idx) => (
+                      <tr key={record.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 text-gray-500">{idx + 1}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <UserOutlined className="text-blue-500" />
+                            <span className="font-medium">{record.employee}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <ShoppingCartOutlined className="text-gray-400" />
+                            <span className="font-semibold">{record.checkoutCount}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">{record.totalItemsSold}</td>
+                        <td className="px-4 py-3">
+                          <span className="text-green-600 font-semibold">{formatCurrency(record.grossTotal)}</span>
+                        </td>
+                        <td className="px-4 py-3">
+                          <span className="text-blue-600 font-semibold">{formatCurrency(record.cashCollected - record.changeGiven)}</span>
+                        </td>
+                        <td className="px-4 py-3">
+                          {record.seniorDiscountCount > 0 ? (
+                            <div className="flex flex-col">
+                              <Tag color="green" className="w-fit">Yes ({record.seniorDiscountCount})</Tag>
+                              <span className="text-xs text-gray-500">- {formatCurrency(record.seniorDiscountTotal)}</span>
+                            </div>
+                          ) : (
+                            <Tag color="default">No</Tag>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          <Tag color="blue">{record.topCategory}</Tag>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+                {filteredSales.length > 0 && (
+                  <tfoot className="bg-gray-50 border-t border-gray-200">
+                    <tr>
+                      <td colSpan={4} className="px-4 py-3 text-right font-semibold text-gray-700">TOTAL:</td>
+                      <td className="px-4 py-3 font-semibold text-green-600">
+                        {formatCurrency(filteredSales.reduce((sum, r) => sum + r.grossTotal, 0))}
+                      </td>
+                      <td className="px-4 py-3 font-semibold text-blue-600">
+                        {formatCurrency(filteredSales.reduce((sum, r) => sum + (r.cashCollected - r.changeGiven), 0))}
+                      </td>
+                      <td className="px-4 py-3"></td>
+                    </tr>
+                  </tfoot>
+                )}
+              </table>
+            </div>
+          </div>
+
+          {/* POS Checkout Transactions */}
+          <div className="bg-white rounded-lg border border-gray-200 mb-6 overflow-hidden">
+            <div className="bg-gray-50 border-b border-gray-200 px-6 py-3">
+              <div className="flex items-center gap-2">
+                <ShoppingCartOutlined className="text-emerald-600" />
+                <span className="font-semibold text-gray-700">POS Checkout Transactions</span>
+                <Tag color="geekblue" className="ml-2">
+                  {filteredPosCheckouts.length} Checkout(s)
+                </Tag>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">NO.</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Invoice</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Employee</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Customer</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Date/Time</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Items</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Subtotal</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">SR. Discount</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Total</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Cash</th>
+                    <th className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">Change</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {pagedPosCheckouts.length === 0 ? (
+                    <tr>
+                      <td colSpan={11} className="text-center py-12 text-gray-500">
+                        No checkout transactions found for <span className="font-semibold">{selectedDate}</span>.
+                      </td>
+                    </tr>
+                  ) : (
+                    pagedPosCheckouts.map((row, idx) => (
+                      <tr key={row.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 text-gray-500">{posCheckoutStart + idx + 1}</td>
+                        <td className="px-4 py-3 font-mono text-xs text-gray-700">{row.invoice}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <UserOutlined className="text-blue-500" />
+                            <span className="font-medium">{row.employee}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-gray-700">{row.customerName}</td>
+                        <td className="px-4 py-3 text-gray-600">{formatDateTime(row.createdAt)}</td>
+                        <td className="px-4 py-3 font-semibold text-gray-800">{row.itemsCount}</td>
+                        <td className="px-4 py-3 text-gray-800">{formatCurrency(row.subtotal)}</td>
+                        <td className="px-4 py-3">
+                          {row.seniorDiscount ? (
+                            <div className="flex flex-col">
+                              <Tag color="green" className="w-fit">Yes</Tag>
+                              <span className="text-xs text-gray-500">- {formatCurrency(row.discountAmount)}</span>
+                            </div>
+                          ) : (
+                            <Tag color="default">No</Tag>
+                          )}
+                        </td>
+                        <td className="px-4 py-3 text-green-700 font-semibold">{formatCurrency(row.total)}</td>
+                        <td className="px-4 py-3 text-gray-700">{formatCurrency(row.cashCollected)}</td>
+                        <td className="px-4 py-3 text-gray-700">{formatCurrency(row.changeGiven)}</td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Pagination */}
+            {posCheckoutTotal > POS_PAGE_SIZE && (
+              <div className="flex justify-end px-4 py-3 border-t border-gray-200 bg-gray-50">
+                <Pagination
+                  current={posCheckoutPage}
+                  pageSize={POS_PAGE_SIZE}
+                  total={posCheckoutTotal}
+                  onChange={(page) => setPosCheckoutPage(page)}
+                  showSizeChanger={false}
+                />
+              </div>
+            )}
+          </div>
+
+          {/* Performance Table */}
+          <div className="bg-white rounded-lg border border-gray-200 overflow-hidden">
+            <div className="bg-gray-50 border-b border-gray-200 px-6 py-3">
+              <div className="flex items-center gap-2">
+                <StarOutlined className="text-purple-600" />
+                <span className="font-semibold text-gray-700">Performance Metrics</span>
+                <Tag color="purple" className="ml-2">
+                  {filteredPerformance.length} Employees
+                </Tag>
+              </div>
+            </div>
+            <div className="overflow-x-auto">
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="bg-gray-50 border-b border-gray-200">
+                    {performanceColumns.map((col, idx) => (
+                      <th key={idx} className="px-4 py-3 text-left text-xs font-semibold text-gray-600 uppercase tracking-wider">
+                        {col.title}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {filteredPerformance.length === 0 ? (
+                    <tr>
+                      <td colSpan={performanceColumns.length} className="text-center py-12 text-gray-500">
+                        No performance records found for <span className="font-semibold">{selectedDate}</span>.
+                      </td>
+                    </tr>
+                  ) : (
+                    filteredPerformance.map((record, idx) => (
+                      <tr key={record.id} className="hover:bg-gray-50">
+                        <td className="px-4 py-3 text-gray-500">{idx + 1}</td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <UserOutlined className="text-blue-500" />
+                            <span className="font-medium">{record.employee}</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Progress percent={record.attendanceRate} size="small" className="w-32" />
+                            <span className="text-sm font-medium">{record.attendanceRate}%</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Progress percent={record.productivity} size="small" strokeColor="#1677ff" className="w-32" />
+                            <span className="text-sm font-medium">{record.productivity}%</span>
+                          </div>
+                        </td>
+                        <td className="px-4 py-3">
+                          <div className="flex items-center gap-2">
+                            <Progress percent={record.qualityScore} size="small" strokeColor="#52c41a" className="w-32" />
+                            <span className="text-sm font-medium">{record.qualityScore}%</span>
+                          </div>
+                        </td>
+                      </tr>
+                    ))
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Footer */}
+          <div className="mt-6 text-center text-xs text-gray-400 border-t border-gray-200 pt-4">
+            <p>Generated on {currentTime.toLocaleString()} | New Moon Lechon Manok and Liempo</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+export default EmployeeTracker;
